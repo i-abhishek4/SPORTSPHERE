@@ -9,14 +9,17 @@ const Products = require("./models/Products.js");
 const User = require("./models/Users.js");
 const Seller = require("./models/Seller.js");
 const Cart=require("./models/Cart.js");
+const Order = require("./models/Orders.js")
 const session = require("express-session");
 const flash=require("connect-flash");
 const passport = require("passport");
 const Razorpay = require("razorpay");
 const Product = require("./models/Products.js");
 const ExpressError = require("./utils/ExpressError.js");
-const wrapAsync = require("./utils/WrapAsync.js");
-
+const WrapAsync = require("./utils/WrapAsync.js");
+const crypto = require("crypto");//Used to create a secure HMAC hash to verify Razorpay's signature
+require('dotenv').config(); // Load variables from .env
+const {isUserLoggedIn,saveRedirectUrl} = require("./middleware.js");
 
 //routers
 const category = require("./routes/categories.js");
@@ -24,6 +27,8 @@ const reviews = require("./routes/reviews.js");
 const products = require("./routes/products.js");
 const users = require("./routes/user.js");
 const sellers = require("./routes/seller.js");
+
+
 
 //mongoDB connection
 async function main() {
@@ -37,7 +42,9 @@ main().then(() => {
 
 //middlewares
 app.set("view engine", "ejs");
+app.use(express.static('public'));
 app.set("views", path.join(__dirname, "views"));
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(methodOverride("_method"));
 app.engine('ejs', ejsMate);
@@ -83,8 +90,8 @@ passport.deserializeUser(async ({ id, role }, done) => {
 
 //razorpay instance
 const razorpayInstance = new Razorpay({
-    key_id: "rzp_test_8RlMHbMDNhfWw4",
-    key_secret: "015SxpmJtj6mkX5TZGAKLJim",
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
 //flash messages middleware
@@ -103,45 +110,37 @@ app.use("/user",users);
 app.use("/seller",sellers);
 
 //home route
-app.get("/home", async (req, res) => {
+app.get("/home",WrapAsync(async(req, res) => {
     const allProducts = await Products.find({});
     res.render("home.ejs",{allProducts});
     // res.send("home to be implemented")
-})
+}));
 
 //contact
 app.get("/contact", (req, res) => {
-    res.send("Contact page");
+    res.render("contact.ejs");
 })
 
 //about us
 app.get("/about", (req, res) => {
-    res.send("About us page");
+    res.render("about.ejs");
 })
 
-app.get("/search",async(req,res)=>{
+app.get("/search",WrapAsync(async(req,res)=>{
     let {query}=req.query;
-    console.log({query});
-
-    try{
-        const filteredProducts=await Products.find({
-            $or:[
-                {name:{$regex:query,$options:"i"}},
-                {description:{$regex:query,$options:"i"}}
-            ],
-        })
-    
-        res.render("searchProducts.ejs",{filteredProducts,query});
-    }
-    catch(err){
-        console.log(err);
-    }
-})
+    // console.log({query});
+    const filteredProducts=await Products.find({
+        $or:[
+            {name:{$regex:query,$options:"i"}},
+            {description:{$regex:query,$options:"i"}}
+        ],
+    })
+    res.render("searchProducts.ejs",{filteredProducts,query});
+}));
 
 //checkout
-app.get("/checkout",async(req,res)=>{
+app.get("/checkout",isUserLoggedIn,WrapAsync(async(req,res)=>{
     let userId=req.user._id;
-
     let user=await User.findById(userId);
     let cart=await Cart.findOne({userId}).populate("items.productId");
 
@@ -150,13 +149,11 @@ app.get("/checkout",async(req,res)=>{
     },0);
 
     res.render("users/checkout.ejs",{user,cart,totalAmount});
-})
+}));
 
 //razorpay
-app.post("/create-order", async (req, res) => {
+app.post("/create-order", WrapAsync(async (req,res) => {
     const { totalAmount } = req.body; // Total amount from the request body
-    console.log(req.body);
-
     try {
         const options = {
             amount: totalAmount * 100, // Razorpay requires the amount in paise
@@ -166,19 +163,70 @@ app.post("/create-order", async (req, res) => {
 
         // Create the order using Razorpay SDK
         const order = await razorpayInstance.orders.create(options);
-
-        res.status(200).json({
+        // console.log(order);
+        res.status(200).send({
             success: true,
             orderId: order.id, // Send the Razorpay order ID to the frontend
         });
     } catch (error) {
         console.error("Error creating Razorpay order:", error);
-        res.status(500).json({
+        res.status(500).send({
             success: false,
             message: "Failed to create order. Please try again.",
         });
     }
-});
+}));
+//to verify the payment
+app.post("/verify-payment",WrapAsync(async(req,res)=>{
+    const { razorpay_payment_id, razorpay_order_id, razorpay_signature } = req.body;
+    const secret = process.env.RAZORPAY_KEY_SECRET;
+    const generated_signature = crypto
+    .createHmac("sha256", secret)
+    .update(razorpay_order_id + "|" + razorpay_payment_id)
+    .digest("hex");
+    if (generated_signature === razorpay_signature) {
+        let userId = req.user._id;
+        let cart = await Cart.findOne({userId}).populate("items.productId");
+        let order_items = [];
+        let total = 0;
+        for(let item of cart.items){
+            order_items.push({
+                "productId": item.productId._id,
+                "quantity":item.quantity,
+                "price":item.productId.price,
+                "sellerId":item.productId.sellerId,
+            })
+            total += item.quantity * item.productId.price;
+        }
+        let newOrder = new Order({
+            userId:userId,
+            items:order_items,
+            totalAmount:total,
+        })
+        let updatedSellers = new Set();
+        for(let item of cart.items){
+            let sellerId = item.productId.sellerId.toString();
+            if(updatedSellers.has(sellerId))continue;
+            let seller = await Seller.findByIdAndUpdate(item.productId.sellerId,{ $push: { orders: newOrder } });
+            updatedSellers.add(sellerId)
+        }
+        cart.items = [];
+        await cart.save();
+        await newOrder.save()
+        // console.log(newOrder);
+        res.status(200).json({ success: true });
+    }
+}));
+
+//After successful payment
+app.get("/order-success",WrapAsync(async(req,res)=>{
+    req.flash("success","Order Placed successfully!");
+    res.redirect("/user/orders");
+}));
+
+app.post("/pay",WrapAsync(async(req,res)=>{
+    res.status(200).send(req.body);
+}));
 
 
 //logout
@@ -196,14 +244,13 @@ app.get("/logout",(req,res)=>{
 app.all("*", (req, res, next) => {
     next(new ExpressError(404, "Page not found!"));
 });
+
 //Error handling middleware
 app.use((err, req, res, next) => {
     let { statusCode = 500, message="Something went wrong!" } = err;
-    // res.status(statusCode).send(message);
-    // console.log(err.message);
     res.render("error.ejs",{err});
 })
-
+//http://localhost:8080/order-success -payment success
 app.listen(8080, (req, res) => {
     console.log("Listening on port 8080");
 })

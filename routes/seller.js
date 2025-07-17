@@ -4,7 +4,10 @@ const Products = require("../models/Products.js");
 const Cart=require("../models/Cart.js");
 const User = require("../models/Users.js");
 const Seller = require("../models/Seller.js");
+const Order = require("../models/Orders.js");
 const passport = require("passport");
+const {isSellerLoggedIn,saveRedirectUrl,updateOrderStatusIfUniform} = require("../middleware.js");
+const WrapAsync = require("../utils/WrapAsync.js");
 
 //signup //seller
 router.get("/signup", (req, res) => {
@@ -40,37 +43,106 @@ router.post("/signup", async (req, res) => {
 })
 
 //login seller
-router.post("/login",passport.authenticate('seller-local', {failureRedirect: '/seller/login',failureFlash: true,}),async(req, res) => {
+router.post("/login",
+    saveRedirectUrl,
+    passport.authenticate('seller-local', {failureRedirect: '/seller/login',failureFlash: true,}),
+    WrapAsync(async(req, res) => {
+        let redirectUrl = res.locals.redirectUrl || '/seller/dashboard';
         req.flash('success', 'Successfully logged in as seller!');
-        res.redirect('/seller/dashboard');
+        res.redirect(redirectUrl);
     }
-);
+));
 
 //Seller dashboard
-router.get("/dashboard", async (req,res)=>{
-    console.log(req.user);
+router.get("/dashboard",isSellerLoggedIn, WrapAsync(async (req,res)=>{
+    // console.log(req.user);
     // const {_id} = req.user;
     const seller = await Seller.findById(req.user._id).populate("products");
     // console.log(seller);
     res.render("sellers/dashboard.ejs",{seller});
-})
-
+}));
+//All seller products
+router.get("/products",isSellerLoggedIn,WrapAsync(async(req,res)=>{
+    let userId = req.user._id;
+    let seller = await Seller.findById(userId).populate("products");
+    res.render("sellers/products.ejs",{seller});
+}));
 //seller adding new product
-router.get("/product/new",(req,res)=>{
+router.get("/product/new",isSellerLoggedIn,(req,res)=>{
     // let {id} = req.params;
     // console.log(id);
     res.render("sellers/newProductForm.ejs");
 });
 
 //new product
-router.post("/product/new",async(req,res)=>{
+router.post("/product/new",isSellerLoggedIn,WrapAsync(async(req,res)=>{
     // let {id} = req.params;
-    let newProduct = new Products(req.body.product);
+    let newProduct = new Products({...req.body.product,sellerId:req.user._id});
     let seller = await Seller.findByIdAndUpdate(req.user._id,{ $push: { products: newProduct } });
     await newProduct.save();
     res.redirect("/seller/dashboard");
     // console.log(newProduct);
     // console.log(req.body);
-});
+}));
+router.get("/orders",isSellerLoggedIn,WrapAsync(async(req,res)=>{
+    let userid = req.user._id;
+    let seller = await Seller.findById(userid).populate("orders");
+    // console.log(orders);
+    // .populate("items.productId");
+    // console.log(seller);
+    res.render("sellers/orders.ejs",{seller});
+}));
+router.get("/order/:id",isSellerLoggedIn,WrapAsync(async(req,res)=>{
+    let {id} = req.params;
+    let order = await Order.findById(id).populate("items.productId");
+    // console.log(order);
+    res.render("sellers/order.ejs",{order,sellerId:req.user._id});
+}))
 
+//Status update of orders
+router.post("/order/:id",isSellerLoggedIn,WrapAsync(async(req,res)=>{
+    let {id} = req.params;
+    let {items} = req.body;
+    // console.log(items);
+    let order = await Order.findById(id);
+    for(let item of items){
+        let orderItem = order.items.find(i => i.productId.toString() == item.productId.toString());
+        let product = await Products.findById(orderItem.productId);
+        if(product){
+            product.stock = product.stock - 1;
+            await product.save();
+        }
+        if(orderItem)orderItem.status = item.status;
+    }
+    await updateOrderStatusIfUniform(order);
+    await order.save();
+    res.redirect("/seller/orders")
+}));
+
+//Account management
+router.get("/account",isSellerLoggedIn,WrapAsync(async(req,res)=>{
+    let userId = req.user._id;
+    let seller = await Seller.findById(userId);
+    res.render("sellers/account.ejs",{seller});
+}));
+//Account details update
+router.post("/account/update",isSellerLoggedIn,WrapAsync(async(req,res)=>{
+    let userId = req.user._id;
+    let { name,storeName,email, phone, street, pincode, city, state, password } = req.body;
+    let seller = await Seller.findById(userId);
+    if(seller){
+        seller.name = name;
+        seller.storeName = storeName;
+        seller.email = email;
+        seller.phone = phone;
+        seller.address.street = street;
+        seller.address.pincode = pincode;
+        seller.address.city = city;
+        seller.address.state = state;
+    }
+    await seller.save();
+    // console.log(user);
+    req.flash("success","Successfully Saved Changes.")
+    res.redirect("/home")
+}));
 module.exports = router;
